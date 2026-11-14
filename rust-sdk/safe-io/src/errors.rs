@@ -261,6 +261,18 @@ pub enum RustSafeIoError {
         path: PathBuf,
     },
 
+    /// Error indicating an extraction budget (total bytes, single entry bytes, or entry count) was exceeded
+    ///
+    /// # Fields
+    ///
+    /// * `reason` - Which budget was exceeded and the configured limit
+    /// * `path` - Path of the archive entry that triggered the violation, when applicable
+    #[error("Archive extraction budget exceeded: {reason}")]
+    ArchiveBudgetExceededError {
+        reason: String,
+        path: Option<PathBuf>,
+    },
+
     /// Error indicating file copy operation failed
     ///
     /// # Fields

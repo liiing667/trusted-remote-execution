@@ -506,6 +506,12 @@ pub struct WriteOptions {
 ///   When true, extracted files and directories will attempt to maintain their original user and group ownership. This may require elevated privileges.
 /// * `preserve_timestamps` - A bool [`ExtractArchiveOptions::preserve_timestamps`] indicating whether to preserve file modification times from the archive (default = true).
 ///   When true, extracted files and directories will maintain their original modification timestamps. When false, files will use current extraction time.
+/// * `max_extracted_bytes` - An optional byte limit [`ExtractArchiveOptions::max_extracted_bytes`] on the total uncompressed size of all regular file entries (default = unlimited).
+///   Extraction fails with a budget error before any destination writes when the archive headers declare more bytes than the limit.
+/// * `max_entry_size_bytes` - An optional byte limit [`ExtractArchiveOptions::max_entry_size_bytes`] on the uncompressed size of a single regular file entry (default = unlimited).
+///   Extraction fails with a budget error before any destination writes when one entry declares more bytes than the limit.
+/// * `max_entry_count` - An optional limit [`ExtractArchiveOptions::max_entry_count`] on the total number of entries in the archive, including skipped special entries and directories (default = unlimited).
+///   Extraction fails with a budget error before any destination writes when the archive contains more entries than the limit.
 ///
 /// # Examples
 ///
@@ -517,6 +523,9 @@ pub struct WriteOptions {
 ///     .preserve_permissions(true)
 ///     .preserve_ownership(true)
 ///     .preserve_timestamps(true)
+///     .max_extracted_bytes(1024 * 1024 * 100)
+///     .max_entry_size_bytes(1024 * 1024)
+///     .max_entry_count(10_000)
 ///     .build()
 ///     .unwrap();
 /// ```
@@ -533,6 +542,21 @@ pub struct ExtractArchiveOptions {
 
     #[builder(default = "true")]
     pub preserve_timestamps: bool,
+
+    /// Maximum total uncompressed bytes of regular file entries allowed during extraction.
+    /// `None` means no limit.
+    #[builder(default = "None", setter(strip_option))]
+    pub max_extracted_bytes: Option<u64>,
+
+    /// Maximum uncompressed size in bytes of a single regular file entry.
+    /// `None` means no limit.
+    #[builder(default = "None", setter(strip_option))]
+    pub max_entry_size_bytes: Option<u64>,
+
+    /// Maximum number of entries (files, directories and special entries) allowed in the archive.
+    /// `None` means no limit.
+    #[builder(default = "None", setter(strip_option))]
+    pub max_entry_count: Option<u64>,
 }
 
 /// Configuration parameters for creating symbolic links

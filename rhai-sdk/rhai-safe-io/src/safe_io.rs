@@ -1333,6 +1333,9 @@ impl FileHandle {
     /// let extract_options = ExtractArchiveOptions()
     ///     .preserve_permissions(true)
     ///     .preserve_timestamps(true)
+    ///     .max_extracted_bytes(100 * 1024 * 1024)
+    ///     .max_entry_size_bytes(10 * 1024 * 1024)
+    ///     .max_entry_count(10000)
     ///     .build();
     ///
     /// archive_file.extract_archive(extract_dir, extract_options);

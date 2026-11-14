@@ -53,7 +53,10 @@ pub(super) fn register_unix_builders(engine: &mut Engine) {
         setters: [
             (preserve_permissions, bool),
             (preserve_ownership, bool),
-            (preserve_timestamps, bool)
+            (preserve_timestamps, bool),
+            (max_extracted_bytes, i64 => u64),
+            (max_entry_size_bytes, i64 => u64),
+            (max_entry_count, i64 => u64)
         ]
     );
     register_derive_builder_options!(

@@ -52,6 +52,13 @@ pub mod error_constants {
     pub const DISK_USAGE_SUMMARIZE_ALL_FILES_ERR: &str =
         "cannot both summarize and show all entries";
     pub const CHOWN_CAP_REQUIRED_ERR: &str = "Failed to change ownership. CAP_CHOWN capability is required when changing ownership to a different user.";
+    pub const ARCHIVE_ENTRY_COUNT_LIMIT_EXCEEDED_ERR: &str = "Archive entry count limit exceeded";
+    pub const ARCHIVE_TOTAL_SIZE_LIMIT_EXCEEDED_ERR: &str =
+        "Archive total extracted size limit exceeded";
+    pub const ARCHIVE_ENTRY_SIZE_LIMIT_EXCEEDED_ERR: &str =
+        "Archive single entry size limit exceeded";
+    pub const ARCHIVE_ENTRY_SIZE_MISMATCH_ERR: &str =
+        "Archive entry produced more bytes than declared in its header";
 }
 pub const CHUNK_SIZE: usize = 8 * 1024; // 8KB, same chunk size used in GNU coreutils implementation of tail
 pub const BLOCK_SIZE_BYTES: i64 = 512;

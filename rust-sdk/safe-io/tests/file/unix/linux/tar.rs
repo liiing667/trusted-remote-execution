@@ -9,19 +9,121 @@ use rex_test_utils::io::{ArchiveEntry, create_temp_dir_and_path, create_test_arc
 use anyhow::Result;
 use assert_fs::fixture::PathChild;
 use assert_fs::fixture::{FileWriteStr, PathCreateDir};
+use flate2::{Compression, write::GzEncoder};
 use rstest::rstest;
 use rust_safe_io::error_constants::READ_FILE_FLAG_ERR;
 use rust_safe_io::options::{ExtractArchiveOptionsBuilder, OpenFileOptionsBuilder};
+use std::fs::File;
 use std::fs::Permissions;
 use std::fs::set_permissions;
 use std::fs::{metadata, read_dir, read_to_string};
+use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tar::{Builder as TarBuilder, Header as TarHeader};
 use tracing::Level;
 use tracing_subscriber::fmt;
 
 const PERMISSION_EXTRACT_BITMASK: u32 = 0o777;
+
+/// Creates a tar.gz archive containing a regular entry whose header declares a huge size while
+/// only a small payload is actually appended.
+///
+/// This emulates an oversized-entry ("zip bomb" style header) sample without having to allocate
+/// the declared number of bytes. The tar stream is terminated right after the small payload, so
+/// the budget pre-scan must reject the entry purely from its header.
+fn create_archive_with_oversized_header(
+    temp_dir: &assert_fs::TempDir,
+    archive_name: &str,
+    entry_name: &str,
+    declared_size: u64,
+    actual_payload: &[u8],
+) -> Result<()> {
+    let archive_path = temp_dir.path().join(archive_name);
+    let tar_gz = File::create(archive_path)?;
+    let encoder = GzEncoder::new(tar_gz, Compression::default());
+    let mut builder = TarBuilder::new(encoder);
+
+    let mut header = TarHeader::new_gnu();
+    header.set_path(entry_name)?;
+    header.set_size(declared_size);
+    header.set_mode(0o644);
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_cksum();
+    builder.append(&header, actual_payload)?;
+
+    builder.finish()?;
+    Ok(())
+}
+
+/// A raw tar entry whose header size and name are written verbatim, which makes it possible to
+/// craft traversal paths and header/payload size mismatches that the safe builder API rejects.
+struct RawTarEntry<'a> {
+    name: &'a str,
+    payload: &'a [u8],
+}
+
+impl<'a> RawTarEntry<'a> {
+    fn new(name: &'a str, payload: &'a [u8]) -> Self {
+        Self { name, payload }
+    }
+}
+
+/// Builds a tar.gz archive from raw 512-byte tar headers, allowing entries with traversal
+/// sequences (for example `../name`) that the safe `tar::Builder` API refuses to create.
+fn create_raw_tar_gz(
+    temp_dir: &assert_fs::TempDir,
+    archive_name: &str,
+    entries: Vec<RawTarEntry>,
+) -> Result<()> {
+    let archive_path = temp_dir.path().join(archive_name);
+    let tar_gz = File::create(archive_path)?;
+    let mut encoder = GzEncoder::new(tar_gz, Compression::default());
+
+    for entry in entries {
+        let raw_name = entry.name;
+        let payload = entry.payload;
+        let mut header_block = [0_u8; 512];
+        let name_bytes = raw_name.as_bytes();
+        assert!(
+            name_bytes.len() < 100,
+            "raw tar name must fit the classic name field"
+        );
+        header_block[..name_bytes.len()].copy_from_slice(name_bytes);
+
+        fn write_octal(field: &mut [u8], value: u64) {
+            let field_len = field.len();
+            let rendered = format!("{value:0width$o}", width = field_len - 1);
+            field[..field_len - 1].copy_from_slice(rendered.as_bytes());
+        }
+
+        write_octal(&mut header_block[100..108], 0o644);
+        write_octal(&mut header_block[108..116], 0);
+        write_octal(&mut header_block[116..124], 0);
+        write_octal(&mut header_block[124..136], payload.len() as u64);
+        write_octal(&mut header_block[136..148], 0);
+        header_block[156] = b'0'; // regular file type flag
+
+        // The checksum field is treated as eight spaces while computing the checksum.
+        let mut checksum: u32 = header_block.iter().map(|byte| u32::from(*byte)).sum();
+        checksum += u32::from(b' ') * 8;
+        let checksum_rendered = format!("{checksum:06o}\0 ");
+        header_block[148..156].copy_from_slice(checksum_rendered.as_bytes());
+
+        encoder.write_all(&header_block)?;
+        encoder.write_all(payload)?;
+
+        let padding = (512 - payload.len() % 512) % 512;
+        if padding > 0 {
+            encoder.write_all(&vec![0_u8; padding])?;
+        }
+    }
+
+    encoder.write_all(&[0_u8; 1024])?;
+    encoder.finish()?;
+    Ok(())
+}
 
 /// Enables code coverage for `tracing::debug` calls.
 fn init_test_logger() {
@@ -854,6 +956,449 @@ fn test_safe_extract_archive_invalid_tar_gz() -> Result<()> {
 
     assert!(result.is_err());
     assert_error_contains(result, "invalid gzip");
+
+    Ok(())
+}
+
+/// Given: A tar.gz archive whose regular entries exceed the configured total byte budget
+/// When: safe_extract_archive is called with max_extracted_bytes
+/// Then: Extraction fails with a budget error and no entry is written to the destination
+#[test]
+fn test_safe_extract_archive_total_bytes_budget_exceeded() -> Result<()> {
+    let (temp_dir, temp_dir_path) = create_temp_dir_and_path()?;
+    let (dest_dir, dest_dir_path) = create_temp_dir_and_path()?;
+
+    create_test_archive(
+        &temp_dir,
+        "budget.tar.gz",
+        vec![
+            ArchiveEntry::file("file1.txt", "0123456789"),
+            ArchiveEntry::file("file2.txt", "0123456789"),
+        ],
+    )?;
+
+    let dir_handle = open_test_dir_handle(&temp_dir_path);
+    let dest_handle = open_test_dir_handle(&dest_dir_path);
+
+    let archive_handle = dir_handle.safe_open_file(
+        &DEFAULT_TEST_CEDAR_AUTH,
+        "budget.tar.gz",
+        OpenFileOptionsBuilder::default()
+            .read(true)
+            .build()
+            .unwrap(),
+    )?;
+
+    let options = ExtractArchiveOptionsBuilder::default()
+        .max_extracted_bytes(15_u64)
+        .build()
+        .unwrap();
+
+    let result =
+        archive_handle.safe_extract_archive(&DEFAULT_TEST_CEDAR_AUTH, dest_handle, options);
+
+    assert!(result.is_err());
+    assert_error_contains(result, "Archive extraction budget exceeded");
+
+    assert!(!Path::new(&dest_dir_path).join("file1.txt").exists());
+    assert!(!Path::new(&dest_dir_path).join("file2.txt").exists());
+
+    let dest_entries: Vec<_> =
+        read_dir(dest_dir.path())?.collect::<std::result::Result<Vec<_>, _>>()?;
+    assert!(
+        dest_entries.is_empty(),
+        "budget failure must not leave partial extraction"
+    );
+
+    Ok(())
+}
+
+/// Given: A tar.gz archive with a single regular entry larger than the per-entry budget
+/// When: safe_extract_archive is called with max_entry_size_bytes
+/// Then: Extraction fails with a budget error and the entry is not extracted
+#[test]
+fn test_safe_extract_archive_entry_size_budget_exceeded() -> Result<()> {
+    let (temp_dir, temp_dir_path) = create_temp_dir_and_path()?;
+    let (_dest_dir, dest_dir_path) = create_temp_dir_and_path()?;
+
+    create_test_archive(
+        &temp_dir,
+        "entry_budget.tar.gz",
+        vec![ArchiveEntry::file(
+            "large.txt",
+            "this content is thirty bytes long!",
+        )],
+    )?;
+
+    let dir_handle = open_test_dir_handle(&temp_dir_path);
+    let dest_handle = open_test_dir_handle(&dest_dir_path);
+
+    let archive_handle = dir_handle.safe_open_file(
+        &DEFAULT_TEST_CEDAR_AUTH,
+        "entry_budget.tar.gz",
+        OpenFileOptionsBuilder::default()
+            .read(true)
+            .build()
+            .unwrap(),
+    )?;
+
+    let options = ExtractArchiveOptionsBuilder::default()
+        .max_entry_size_bytes(10_u64)
+        .build()
+        .unwrap();
+
+    let result =
+        archive_handle.safe_extract_archive(&DEFAULT_TEST_CEDAR_AUTH, dest_handle, options);
+
+    assert!(result.is_err());
+    assert_error_contains(result, "single entry size limit exceeded");
+    assert!(!Path::new(&dest_dir_path).join("large.txt").exists());
+
+    Ok(())
+}
+
+/// Given: A tar.gz archive containing more entries than the configured entry count budget
+/// When: safe_extract_archive is called with max_entry_count
+/// Then: Extraction fails with a budget error before anything is written and directories count too
+#[test]
+fn test_safe_extract_archive_entry_count_budget_exceeded() -> Result<()> {
+    let (temp_dir, temp_dir_path) = create_temp_dir_and_path()?;
+    let (_dest_dir, dest_dir_path) = create_temp_dir_and_path()?;
+
+    create_test_archive(
+        &temp_dir,
+        "count.tar.gz",
+        vec![
+            ArchiveEntry::directory("subdir/"),
+            ArchiveEntry::file("subdir/file1.txt", "one"),
+            ArchiveEntry::file("subdir/file2.txt", "two"),
+        ],
+    )?;
+
+    let dir_handle = open_test_dir_handle(&temp_dir_path);
+    let dest_handle = open_test_dir_handle(&dest_dir_path);
+
+    let archive_handle = dir_handle.safe_open_file(
+        &DEFAULT_TEST_CEDAR_AUTH,
+        "count.tar.gz",
+        OpenFileOptionsBuilder::default()
+            .read(true)
+            .build()
+            .unwrap(),
+    )?;
+
+    let options = ExtractArchiveOptionsBuilder::default()
+        .max_entry_count(2_u64)
+        .build()
+        .unwrap();
+
+    let result =
+        archive_handle.safe_extract_archive(&DEFAULT_TEST_CEDAR_AUTH, dest_handle, options);
+
+    assert!(result.is_err());
+    assert_error_contains(result, "entry count limit exceeded");
+    assert!(!Path::new(&dest_dir_path).join("subdir").exists());
+
+    Ok(())
+}
+
+/// Given: An archive entry whose header declares an enormous size but carries little payload
+/// When: safe_extract_archive is called with a smaller per-entry budget
+/// Then: The header-only pre-scan rejects it without creating any destination path
+#[test]
+fn test_safe_extract_archive_oversized_header_sample() -> Result<()> {
+    let (temp_dir, temp_dir_path) = create_temp_dir_and_path()?;
+    let (dest_dir, dest_dir_path) = create_temp_dir_and_path()?;
+
+    create_archive_with_oversized_header(
+        &temp_dir,
+        "oversized.tar.gz",
+        "bomb.bin",
+        1024 * 1024 * 1024,
+        b"small actual payload",
+    )?;
+
+    let dir_handle = open_test_dir_handle(&temp_dir_path);
+    let dest_handle = open_test_dir_handle(&dest_dir_path);
+
+    let archive_handle = dir_handle.safe_open_file(
+        &DEFAULT_TEST_CEDAR_AUTH,
+        "oversized.tar.gz",
+        OpenFileOptionsBuilder::default()
+            .read(true)
+            .build()
+            .unwrap(),
+    )?;
+
+    let options = ExtractArchiveOptionsBuilder::default()
+        .max_entry_size_bytes(1024_u64)
+        .build()
+        .unwrap();
+
+    let result =
+        archive_handle.safe_extract_archive(&DEFAULT_TEST_CEDAR_AUTH, dest_handle, options);
+
+    assert!(result.is_err());
+    assert_error_contains(result, "single entry size limit exceeded");
+    assert!(!Path::new(&dest_dir_path).join("bomb.bin").exists());
+
+    let dest_entries: Vec<_> =
+        read_dir(dest_dir.path())?.collect::<std::result::Result<Vec<_>, _>>()?;
+    assert!(dest_entries.is_empty());
+
+    Ok(())
+}
+
+/// Given: A tar.gz archive whose entries stay within every configured budget
+/// When: safe_extract_archive is called with budgets set at or above the archive sizes
+/// Then: Extraction succeeds and file contents are correct
+#[test]
+fn test_safe_extract_archive_within_budgets() -> Result<()> {
+    let (temp_dir, temp_dir_path) = create_temp_dir_and_path()?;
+    let (_dest_dir, dest_dir_path) = create_temp_dir_and_path()?;
+
+    create_test_archive(
+        &temp_dir,
+        "within.tar.gz",
+        vec![
+            ArchiveEntry::file("file1.txt", "content-one"),
+            ArchiveEntry::file("file2.txt", "content-two"),
+        ],
+    )?;
+
+    let dir_handle = open_test_dir_handle(&temp_dir_path);
+    let dest_handle = open_test_dir_handle(&dest_dir_path);
+
+    let archive_handle = dir_handle.safe_open_file(
+        &DEFAULT_TEST_CEDAR_AUTH,
+        "within.tar.gz",
+        OpenFileOptionsBuilder::default()
+            .read(true)
+            .build()
+            .unwrap(),
+    )?;
+
+    let options = ExtractArchiveOptionsBuilder::default()
+        .max_extracted_bytes(100_u64)
+        .max_entry_size_bytes(50_u64)
+        .max_entry_count(2_u64)
+        .build()
+        .unwrap();
+
+    let result =
+        archive_handle.safe_extract_archive(&DEFAULT_TEST_CEDAR_AUTH, dest_handle, options);
+
+    assert!(result.is_ok());
+    assert_eq!(
+        read_to_string(Path::new(&dest_dir_path).join("file1.txt"))?,
+        "content-one"
+    );
+    assert_eq!(
+        read_to_string(Path::new(&dest_dir_path).join("file2.txt"))?,
+        "content-two"
+    );
+
+    Ok(())
+}
+
+/// Given: A tar.gz archive containing a path traversal (prefix escape) entry
+/// When: safe_extract_archive is called with a budget configured
+/// Then: The traversal entry never escapes the destination directory and normal entries extract
+#[test]
+fn test_safe_extract_archive_prefix_traversal_sample() -> Result<()> {
+    let (temp_dir, temp_dir_path) = create_temp_dir_and_path()?;
+    let (dest_dir, dest_dir_path) = create_temp_dir_and_path()?;
+
+    create_raw_tar_gz(
+        &temp_dir,
+        "prefix.tar.gz",
+        vec![
+            RawTarEntry::new("../escaped.txt", b"must stay inside"),
+            RawTarEntry::new("safe.txt", b"inside content"),
+        ],
+    )?;
+
+    let dir_handle = open_test_dir_handle(&temp_dir_path);
+    let dest_handle = open_test_dir_handle(&dest_dir_path);
+
+    let archive_handle = dir_handle.safe_open_file(
+        &DEFAULT_TEST_CEDAR_AUTH,
+        "prefix.tar.gz",
+        OpenFileOptionsBuilder::default()
+            .read(true)
+            .build()
+            .unwrap(),
+    )?;
+
+    let options = ExtractArchiveOptionsBuilder::default()
+        .max_extracted_bytes(1024_u64)
+        .max_entry_size_bytes(1024_u64)
+        .max_entry_count(10_u64)
+        .build()
+        .unwrap();
+
+    let result =
+        archive_handle.safe_extract_archive(&DEFAULT_TEST_CEDAR_AUTH, dest_handle, options);
+
+    assert!(result.is_ok());
+    assert!(!Path::new(&dest_dir_path).join("../escaped.txt").exists());
+    assert!(
+        !dest_dir
+            .path()
+            .parent()
+            .unwrap()
+            .join("escaped.txt")
+            .exists()
+    );
+    assert_eq!(
+        read_to_string(Path::new(&dest_dir_path).join("safe.txt"))?,
+        "inside content"
+    );
+
+    Ok(())
+}
+
+/// Given: A destination directory holding pre-existing files and a budget that will be exceeded
+/// When: safe_extract_archive fails the pre-scan
+/// Then: Pre-existing files are untouched and no partial extraction artifacts remain
+#[test]
+fn test_safe_extract_archive_budget_failure_preserves_preexisting_files() -> Result<()> {
+    let (temp_dir, temp_dir_path) = create_temp_dir_and_path()?;
+    let (dest_dir, dest_dir_path) = create_temp_dir_and_path()?;
+
+    let existing = dest_dir.child("existing.txt");
+    existing.write_str("keep me")?;
+
+    create_test_archive(
+        &temp_dir,
+        "mix.tar.gz",
+        vec![ArchiveEntry::file("new.txt", "x".repeat(100).as_str())],
+    )?;
+
+    let dir_handle = open_test_dir_handle(&temp_dir_path);
+    let dest_handle = open_test_dir_handle(&dest_dir_path);
+
+    let archive_handle = dir_handle.safe_open_file(
+        &DEFAULT_TEST_CEDAR_AUTH,
+        "mix.tar.gz",
+        OpenFileOptionsBuilder::default()
+            .read(true)
+            .build()
+            .unwrap(),
+    )?;
+
+    let options = ExtractArchiveOptionsBuilder::default()
+        .max_extracted_bytes(10_u64)
+        .build()
+        .unwrap();
+
+    let result =
+        archive_handle.safe_extract_archive(&DEFAULT_TEST_CEDAR_AUTH, dest_handle, options);
+
+    assert!(result.is_err());
+    assert_eq!(read_to_string(existing.path())?, "keep me");
+    assert!(!Path::new(&dest_dir_path).join("new.txt").exists());
+
+    Ok(())
+}
+
+/// Given: An entry whose streaming payload exceeds the configured per-entry byte limit
+/// When: safe_extract_archive streams the entry with a smaller max_entry_size_bytes
+/// Then: The streaming budget guard aborts the copy and rollback leaves no extracted file
+#[test]
+fn test_safe_extract_archive_streaming_guard_enforces_entry_limit() -> Result<()> {
+    let (temp_dir, temp_dir_path) = create_temp_dir_and_path()?;
+    let (dest_dir, dest_dir_path) = create_temp_dir_and_path()?;
+
+    create_raw_tar_gz(
+        &temp_dir,
+        "malformed.tar.gz",
+        vec![RawTarEntry::new("data.bin", b"0123456789abcdef")],
+    )?;
+
+    let dir_handle = open_test_dir_handle(&temp_dir_path);
+    let dest_handle = open_test_dir_handle(&dest_dir_path);
+
+    let archive_handle = dir_handle.safe_open_file(
+        &DEFAULT_TEST_CEDAR_AUTH,
+        "malformed.tar.gz",
+        OpenFileOptionsBuilder::default()
+            .read(true)
+            .build()
+            .unwrap(),
+    )?;
+
+    let options = ExtractArchiveOptionsBuilder::default()
+        .max_extracted_bytes(1024_u64)
+        .max_entry_size_bytes(8_u64)
+        .max_entry_count(10_u64)
+        .build()
+        .unwrap();
+
+    let result =
+        archive_handle.safe_extract_archive(&DEFAULT_TEST_CEDAR_AUTH, dest_handle, options);
+
+    assert!(result.is_err());
+    assert_error_contains(result, "Archive extraction budget exceeded");
+    assert!(!Path::new(&dest_dir_path).join("data.bin").exists());
+
+    let dest_entries: Vec<_> =
+        read_dir(dest_dir.path())?.collect::<std::result::Result<Vec<_>, _>>()?;
+    assert!(dest_entries.is_empty());
+
+    Ok(())
+}
+
+/// Given: An archive where an earlier entry extracts successfully and a later entry exceeds the budget
+/// When: safe_extract_archive fails midway
+/// Then: Rollback removes every already-created path, including nested directories and files
+#[test]
+fn test_safe_extract_archive_rolls_back_partial_extraction() -> Result<()> {
+    let (temp_dir, temp_dir_path) = create_temp_dir_and_path()?;
+    let (dest_dir, dest_dir_path) = create_temp_dir_and_path()?;
+
+    create_test_archive(
+        &temp_dir,
+        "partial.tar.gz",
+        vec![
+            ArchiveEntry::directory("already/created/nested/"),
+            ArchiveEntry::file("already/created/nested/first.txt", "first file content"),
+            ArchiveEntry::file("second.txt", "x".repeat(200).as_str()),
+        ],
+    )?;
+
+    let dir_handle = open_test_dir_handle(&temp_dir_path);
+    let dest_handle = open_test_dir_handle(&dest_dir_path);
+
+    let archive_handle = dir_handle.safe_open_file(
+        &DEFAULT_TEST_CEDAR_AUTH,
+        "partial.tar.gz",
+        OpenFileOptionsBuilder::default()
+            .read(true)
+            .build()
+            .unwrap(),
+    )?;
+
+    let options = ExtractArchiveOptionsBuilder::default()
+        .max_entry_size_bytes(100_u64)
+        .build()
+        .unwrap();
+
+    let result =
+        archive_handle.safe_extract_archive(&DEFAULT_TEST_CEDAR_AUTH, dest_handle, options);
+
+    assert!(result.is_err());
+    assert_error_contains(result, "single entry size limit exceeded");
+
+    assert!(!Path::new(&dest_dir_path).join("already").exists());
+    assert!(!Path::new(&dest_dir_path).join("second.txt").exists());
+
+    let dest_entries: Vec<_> =
+        read_dir(dest_dir.path())?.collect::<std::result::Result<Vec<_>, _>>()?;
+    assert!(
+        dest_entries.is_empty(),
+        "rollback must remove all partial extraction paths"
+    );
 
     Ok(())
 }
